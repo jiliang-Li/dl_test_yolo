@@ -7,272 +7,317 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-#include <thread>
-
+#define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH (50 * 1024 * 1024)
+#include <httplib.h>
 #include <opencv2/opencv.hpp>
 
 #include "dlutil/dl_log.h"
 #include "dlcuda/dl_device.h"
 #include "dlcuda/dl_memory_copy.h"
-#include "dlvid/dl_vpu_device.h"
 #include "dlnne/dlnne_device.h"
-#include "dlnne_algo_unit_yolov5.h"
+#include "helper/dlnne_impl/dlnne_algo_unit_yolov5.h"
+
 
 using namespace dl;
 
-// 列出 dir 下所有 .jpg/.jpeg 文件（不递归）
-static std::vector<std::string> list_jpg_files(const std::string &dir)
+// 解析 size 字符串，支持 "[640, 640]"、"640,640"、"640x640"、"640 640"
+static bool parse_size(const std::string& s, int& w, int& h)
 {
-    std::vector<std::string> files;
-
-    DIR *dp = opendir(dir.c_str());
-    if (!dp)
+    std::string tmp;
+    tmp.reserve(s.size());
+    for (char c : s)
     {
-        std::cerr << "[ERROR] cannot open dir: " << dir << std::endl;
-        return files;
+        if (c == ' ' || c == '\t') continue;
+        tmp.push_back(c);
     }
 
-    struct dirent *entry;
-    while ((entry = readdir(dp)) != nullptr)
+    // [w,h]
+    if (sscanf(tmp.c_str(), "[%d,%d]", &w, &h) == 2) return true;
+    // w,h
+    if (sscanf(tmp.c_str(), "%d,%d", &w, &h) == 2) return true;
+    // w x h
+    if (sscanf(tmp.c_str(), "%dx%d", &w, &h) == 2) return true;
+    // w h
+    if (sscanf(tmp.c_str(), "%d%d", &w, &h) == 2) return true;
+    return false;
+}
+
+// 把一张 BGR 图按 patch_w * patch_h 切成网格
+struct PatchInfo
+{
+    cv::Mat bgr;
+    int offset_x;
+    int offset_y;
+};
+
+static std::vector<PatchInfo> split_image_to_patches(const cv::Mat& bgr, int patch_w, int patch_h)
+{
+    std::vector<PatchInfo> patches;
+
+    if (patch_w <= 0 || patch_h <= 0)
     {
-        std::string name = entry->d_name;
-        if (name == "." || name == "..") continue;
+        // 不指定 size，整张图作为一个 patch
+        patches.push_back({bgr, 0, 0});
+        return patches;
+    }
 
-        if (name.size() >= 4)
+    // 确保 patch 宽高为偶数（YUV420 要求）
+    patch_w = (patch_w / 2) * 2;
+    patch_h = (patch_h / 2) * 2;
+
+    if (patch_w <= 0 || patch_h <= 0)
+    {
+        patches.push_back({bgr, 0, 0});
+        return patches;
+    }
+
+    int img_w = bgr.cols;
+    int img_h = bgr.rows;
+
+    if (img_w < patch_w || img_h < patch_h)
+    {
+        // 太小了，就不切了
+        patches.push_back({bgr, 0, 0});
+        return patches;
+    }
+
+    int num_cols = img_w / patch_w;
+    int num_rows = img_h / patch_h;
+
+    for (int r = 0; r < num_rows; ++r)
+    {
+        for (int c = 0; c < num_cols; ++c)
         {
-            std::string lower = name;
-            for (auto &c : lower)
-                c = std::tolower(static_cast<unsigned char>(c));
+            int x0 = c * patch_w;
+            int y0 = r * patch_h;
 
-            if (lower.size() >= 4 &&
-                (lower.compare(lower.size() - 4, 4, ".jpg") == 0 ||
-                 lower.compare(lower.size() - 5, 5, ".jpeg") == 0))
+            if (x0 + patch_w > img_w || y0 + patch_h > img_h)
             {
-                files.push_back(dir + "/" + name);
+                continue;
             }
+
+            cv::Rect roi(x0, y0, patch_w, patch_h);
+            PatchInfo p;
+            p.bgr = bgr(roi).clone(); // clone 防止后面覆盖
+            p.offset_x = x0;
+            p.offset_y = y0;
+            patches.push_back(std::move(p));
         }
     }
-    closedir(dp);
-    return files;
-}
 
-static void showUsage()
-{
-    DlLogI << "Usage: ./test_yolov5_mt [options]";
-    DlLogI << "  -n <name>   : 算法单元名称，默认 DlAlgorithmUnit_Yolov5";
-    DlLogI << "  -d <dir>    : 图片目录，默认 ../../../resource/images";
-    DlLogI << "  -l <level>  : 日志级别 0-4 (debug/info/warn/error/fatal)，默认 1";
-    DlLogI << "  -t <num>    : 线程数，默认 4";
-    DlLogI << "  -h          : 显示帮助";
-    exit(0);
-}
-
-static void getCustomOpt(int argc, char *argv[],
-                         std::string &network_unit_name,
-                         std::string &image_dir,
-                         DlLoggerSeverity &log_level,
-                         int &num_threads)
-{
-    int opt = 0;
-    const char *opt_string = "n:d:l:t:h";
-    while (-1 != (opt = getopt(argc, argv, opt_string)))
+    if (patches.empty())
     {
-        switch (opt)
-        {
-        case 'n':
-            network_unit_name = optarg;
-            break;
-        case 'd':
-            image_dir = optarg;
-            break;
-        case 'l':
-            log_level = static_cast<DlLoggerSeverity>(atoi(optarg));
-            break;
-        case 't':
-            num_threads = std::max(1, atoi(optarg));
-            break;
-        default:
-            showUsage();
-            break;
-        }
+        patches.push_back({bgr, 0, 0});
     }
+
+    return patches;
 }
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    DlLogI << "Test yolov5 multi-thread start!";
+    DlLogI << "HTTP Yolov5 server start!";
 
-    // 默认参数
-    std::string network_unit_name = "DlAlgorithmUnit_Yolov5";
-    std::string image_dir = "../../../resource/images";
-    DlLoggerSeverity log_level = DlLoggerSeverity_INFO;
-    int num_threads = 16;
-
-    getCustomOpt(argc, argv, network_unit_name, image_dir, log_level, num_threads);
-    setDlLoggerSeverity(log_level);
-
-    // 枚举所有图片
-    auto image_files = list_jpg_files(image_dir);
-    if (image_files.empty())
-    {
-        std::cerr << "[ERROR] no jpg/jpeg found in " << image_dir << std::endl;
-        return -1;
-    }
-    std::cout << "[INFO] found " << image_files.size()
-              << " images in " << image_dir << std::endl;
-
-    // 获取设备 & 算法单元（所有线程共享一个）
     int device_id = 0;
-    auto dl_device    = DlcudaDeviceManager::getInstance().getDlcudaDevice(device_id);
+    DlPixelFormat pixel_format = DlPixelFormat_YUV420P;
+    std::string network_unit_name = "DlAlgorithmUnit_Yolov5";
+
+    // 初始化设备和网络单元（全局共用一份）
+    auto dl_device = DlcudaDeviceManager::getInstance().getDlcudaDevice(device_id);
     auto dlnne_device = DlnneDeviceManager::getInstance().getDlnneDevice(device_id);
-    auto dlnne_network_unit =
-        dlnne_device->requireDlAlgorithmUnit(network_unit_name);
+    auto dlnne_network_unit = dlnne_device->requireDlAlgorithmUnit(network_unit_name);
     dlnne_network_unit->waitEngineSetupDone();
 
-    auto start_all = std::chrono::steady_clock::now();
+    httplib::Server svr;
+    svr.set_payload_max_length(10 * 1024 * 1024);   // 允许最多 <n>MB 的 body: n * 1024 * 1024
 
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
+    // 简单 access log
+    svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
+        DlLogI << "[HTTP] " << req.method << " " << req.path << " status=" << res.status << " body_len=" << req.body.size();
+    });
 
-    for (int t = 0; t < num_threads; ++t)
+    // 错误处理（4xx/5xx 时会走这里）
+    svr.set_error_handler([](const httplib::Request &req, httplib::Response &res) {
+        DlLogE << "[HTTP ERROR] " << res.status << " on " << req.method << " " << req.path << ", body_len=" << req.body.size();
+    });
+
+    // 路径兼容 TorchServe 风格: /predictions/<model_name>
+    // svr.Post(R"(/predictions/(.+))",
+    svr.Post("/predictions/yolo5", [dl_device, dlnne_network_unit, pixel_format]
+        (const httplib::Request& req, httplib::Response& res)
+             {
+                DlLogI << "收到Post请求";
+                 try
+                 {
+                     // 1) 拿参数：data(bytes)、size(string)、codec(string)
+                     if (!req.has_param("data"))
+                     {
+                         res.status = 400;
+                         res.set_content(R"({"code":1,"msg":"missing 'data' field"})", "application/json");
+                         return;
+                     }
+
+                     const std::string& data_param = req.get_param_value("data");
+                     std::string size_param;
+                     if (req.has_param("size"))
+                     {
+                         size_param = req.get_param_value("size");
+                     }
+
+                     std::string codec = "cv2bytes";
+                     if (req.has_param("codec"))
+                     {
+                         codec = req.get_param_value("codec");
+                     }
+
+                     // 2) data_param 是经过 x-www-form-urlencoded 解码后的二进制 JPEG
+                     std::vector<unsigned char> jpeg_data(data_param.begin(), data_param.end());
+
+                     cv::Mat bgr = cv::imdecode(jpeg_data, cv::IMREAD_COLOR);
+                     if (bgr.empty())
+                     {
+                         res.status = 400;
+                         res.set_content(R"({"code":2,"msg":"imdecode failed"})", "application/json");
+                         return;
+                     }
+
+                     int img_w = bgr.cols;
+                     int img_h = bgr.rows;
+                     DlLogI << "[HTTP] recv image, codec=" << codec << ", size=" << img_w << "x" << img_h;
+
+                     // 3) 解析 size，决定裁剪 patch 大小
+                     int patch_w = 0, patch_h = 0;
+                     if (!size_param.empty())
+                     {
+                         if (!parse_size(size_param, patch_w, patch_h))
+                         {
+                             DlLogW << "[HTTP] parse size failed: " << size_param << ", use whole image.";
+                             patch_w = 0;
+                             patch_h = 0;
+                         }
+                     }
+
+                     auto patches = split_image_to_patches(bgr, patch_w, patch_h);
+                     DlLogI << "[HTTP] split into " << patches.size() << " patches.";
+
+                     // 4) 为每个 patch 构造 DlFrame、异步提交推理任务
+                     auto h2d_copy_helper = dl_device->getMemCopyHelper(cudaMemcpyHostToDevice);
+
+                     struct TaskCtx
+                     {
+                         std::future<std::shared_ptr<DlnneUserOutputBase>> fut;
+                         int offset_x;
+                         int offset_y;
+                     };
+                     std::vector<TaskCtx> tasks;
+                     tasks.reserve(patches.size());
+
+                     for (size_t i = 0; i < patches.size(); ++i)
+                     {
+                         const auto& p = patches[i];
+
+                         // 确保 patch 宽高为偶数
+                         int even_w = (p.bgr.cols / 2) * 2;
+                         int even_h = (p.bgr.rows / 2) * 2;
+                         if (even_w <= 0 || even_h <= 0) continue;
+
+                         cv::Mat patch_even = p.bgr(cv::Rect(0, 0, even_w, even_h));
+
+                         // BGR -> YUV420P (I420)
+                         cv::Mat yuv;
+                         cv::cvtColor(patch_even, yuv, cv::COLOR_BGR2YUV_I420);
+
+                         auto host_frame = std::make_shared<DlFrame>(DlMemoryType_Host);
+                         host_frame->resize(even_w, even_h, pixel_format);
+
+                         if (host_frame->size != static_cast<uint64_t>(yuv.total()))
+                         {
+                             DlLogW << "[HTTP] WARN patch " << i << " frame_size=" << host_frame->size <<
+                                 " != yuv.total=" << yuv.total();
+                         }
+
+                         std::memcpy(host_frame->data, yuv.data, std::min<uint64_t>(host_frame->size, yuv.total()));
+
+                         auto dev_frame = std::make_shared<DlFrame>(DlMemoryType_Device);
+                         dev_frame->index = static_cast<int>(i); // 仅调试用
+                         dev_frame->resize(even_w, even_h, pixel_format);
+
+                         h2d_copy_helper->addMemcpyTask(dev_frame->data, host_frame->data, host_frame->size).get();
+
+                         auto input = dlnne_network_unit->createTestInput(dev_frame);
+                         auto fut = dlnne_network_unit->addDlnneInferTask(input);
+
+                         tasks.push_back(TaskCtx{std::move(fut), p.offset_x, p.offset_y});
+                     }
+
+                     // 5) 等待所有 patch 的结果，并汇总
+                     //    这里简单返回 JSON 数组，每个元素是一个检测框
+                     std::ostringstream oss;
+                     oss << R"({"code":0,"msg":"ok","detections":[)";
+
+                     bool first_det = true;
+
+                     for (auto& tk : tasks)
+                     {
+                         auto base_output = tk.fut.get();
+                         auto yolo_out = std::dynamic_pointer_cast<DlnneYolov5Output>(base_output);
+                         if (!yolo_out) continue;
+
+                         for (auto& rect : yolo_out->rect_vector)
+                         {
+                             // 如果你想返回“原图全局坐标”，在这里加偏移即可：
+                             int gx1 = rect.left + tk.offset_x;
+                             int gy1 = rect.top + tk.offset_y;
+                             int gx2 = rect.right + tk.offset_x;
+                             int gy2 = rect.bottom + tk.offset_y;
+
+                             if (!first_det)
+                             {
+                                 oss << ",";
+                             }
+                             first_det = false;
+
+                             oss << "{"
+                                 << R"("cls":)" << rect.classification << ","
+                                 << R"("score":)" << rect.precision << ","
+                                 << R"("x1":)" << gx1 << ","
+                                 << R"("y1":)" << gy1 << ","
+                                 << R"("x2":)" << gx2 << ","
+                                 << R"("y2":)" << gy2
+                                 << "}";
+                         }
+                     }
+
+                     oss << "]}";
+
+                     res.status = 200;
+                     res.set_content(oss.str(), "application/json");
+                 }
+                 catch (const std::exception& e)
+                 {
+                     DlLogE << "[HTTP] exception: " << e.what();
+                     res.status = 500;
+                     std::string msg = std::string(R"({"code":500,"msg":")") + e.what() + "\"}";
+                     res.set_content(msg, "application/json");
+                 } catch (...)
+                 {
+                     DlLogE << "[HTTP] unknown exception";
+                     res.status = 500;
+                     res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
+                 }
+             });
+
+    // 简单的健康检查
+    svr.Get("/ping", [](const httplib::Request&, httplib::Response& res)
     {
-        workers.emplace_back([t,
-                              &image_files,
-                              dl_device,
-                              dlnne_network_unit]()
-        {
-            DlLogI << "[Thread " << t << "] start.";
+        DlLogI << "收到Get Ping请求";
+        res.set_content("pong\n", "text/plain");
+    });
 
-            // 每个线程自己的 memcpy helper
-            auto h2d_copy_helper =
-                dl_device->getMemCopyHelper(cudaMemcpyHostToDevice);
-
-            std::vector<std::future<std::shared_ptr<DlnneUserOutputBase>>> futures;
-            futures.reserve(image_files.size());
-
-            // ☆☆☆ 关键修改：每个线程完整遍历 image_files ☆☆☆
-            for (size_t idx = 0; idx < image_files.size(); ++idx)
-            {
-                const std::string &img_path = image_files[idx];
-                // std::cout << "[Thread " << t << "] load image: "                          << img_path << std::endl;
-
-                // 1) 读 BGR 图
-                cv::Mat bgr = cv::imread(img_path, cv::IMREAD_COLOR);
-                if (bgr.empty())
-                {
-                    std::cerr << "[Thread " << t
-                              << "] WARN imread failed: " << img_path << std::endl;
-                    continue;
-                }
-
-                int width  = bgr.cols;
-                int height = bgr.rows;
-
-                // 2) 宽高若不是 2 的倍数，裁掉最后一行/列（YUV420 要求偶数）
-                if (width % 2 != 0 || height % 2 != 0)
-                {
-                    int even_w = width  & ~1;
-                    int even_h = height & ~1;
-                    cv::Rect roi(0, 0, even_w, even_h);
-                    bgr = bgr(roi).clone();
-                    width  = even_w;
-                    height = even_h;
-                    std::cout << "[Thread " << t << "] adjust to even size: "
-                              << width << "x" << height << std::endl;
-                }
-
-                // 3) BGR -> YUV420P (I420)
-                cv::Mat yuv;
-                try
-                {
-                    cv::cvtColor(bgr, yuv, cv::COLOR_BGR2YUV_I420);
-                }
-                catch (const cv::Exception &e)
-                {
-                    std::cerr << "[Thread " << t
-                              << "] cv::cvtColor failed for " << img_path
-                              << ", err = " << e.what() << std::endl;
-                    continue;   // 这一张跳过
-                }
-
-                if (yuv.cols != width || yuv.rows != height * 3 / 2)
-                {
-                    std::cerr << "[Thread " << t
-                              << "] WARN yuv shape mismatch for " << img_path
-                              << ", got " << yuv.cols << "x" << yuv.rows
-                              << ", expect " << width << "x" << height * 3 / 2
-                              << std::endl;
-                    continue;
-                }
-
-                // 4) 拷贝到 host DlFrame (YUV420P)
-                auto host_frame = std::make_shared<DlFrame>(DlMemoryType_Host);
-                host_frame->resize(width, height, DlPixelFormat_YUV420P);
-                // 帧 index 可以带线程信息，方便调试
-                host_frame->index = static_cast<int>(t * 1000000 + idx);
-
-                if (host_frame->size != static_cast<uint64_t>(yuv.total()))
-                {
-                    std::cerr << "[Thread " << t
-                              << "] WARN frame_size(" << host_frame->size
-                              << ") != yuv.total(" << yuv.total()
-                              << ") for " << img_path << std::endl;
-                }
-
-                std::memcpy(host_frame->data, yuv.data,
-                            std::min<uint64_t>(host_frame->size, yuv.total()));
-
-                // 5) 拷贝到 device DlFrame
-                auto dev_frame = std::make_shared<DlFrame>(DlMemoryType_Device);
-                dev_frame->resize(width, height, DlPixelFormat_YUV420P);
-                dev_frame->index = host_frame->index;
-
-                h2d_copy_helper
-                    ->addMemcpyTask(dev_frame->data,
-                                    host_frame->data,
-                                    host_frame->size)
-                    .get();
-
-                // 6) 构造输入 & 入队推理（不立即 get，让引擎自己组 batch）
-                auto dlnne_input = dlnne_network_unit->createTestInput(dev_frame);
-                futures.emplace_back(
-                    dlnne_network_unit->addDlnneInferTask(dlnne_input)
-                );
-            }
-
-            // 7) 线程收尾：等待所有 future 完成
-            for (auto &f : futures)
-            {
-                try
-                {
-                    auto base_output = f.get();
-                    (void)base_output;
-                }
-                catch (const std::exception &e)
-                {
-                    std::cerr << "[Thread " << t
-                              << "] ERROR in future.get(): " << e.what()
-                              << std::endl;
-                }
-            }
-
-            DlLogI << "[Thread " << t << "] done.";
-        });
-    }
-
-    for (auto &th : workers)
-    {
-        if (th.joinable()) th.join();
-    }
-
-    auto end_all = std::chrono::steady_clock::now();
-    double total_ms =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            end_all - start_all).count() / 1000.0;
-
-    DlLogI << "All tasks done. total cost = " << total_ms << " ms";
+    int port = 6650;
+    DlLogI << "Listening on 0.0.0.0:" << port;
+    svr.listen("0.0.0.0", port);
 
     dlnne_device->releaseDlAlgorithmUnit(network_unit_name);
-    DlLogI << "Test yolov5 multi-thread done!";
+    DlLogI << "HTTP Yolov5 server stop.";
     return 0;
 }
