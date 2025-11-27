@@ -7,6 +7,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
 #include <opencv2/opencv.hpp>
 
@@ -19,7 +20,7 @@
 
 using namespace dl;
 
-// 简单的工具函数：列出 dir 下所有 .jpg/.jpeg 文件（不递归）
+// 列出 dir 下所有 .jpg/.jpeg 文件（不递归）
 static std::vector<std::string> list_jpg_files(const std::string &dir)
 {
     std::vector<std::string> files;
@@ -40,7 +41,9 @@ static std::vector<std::string> list_jpg_files(const std::string &dir)
         if (name.size() >= 4)
         {
             std::string lower = name;
-            for (auto &c : lower) c = std::tolower(static_cast<unsigned char>(c));
+            for (auto &c : lower)
+                c = std::tolower(static_cast<unsigned char>(c));
+
             if (lower.size() >= 4 &&
                 (lower.compare(lower.size() - 4, 4, ".jpg") == 0 ||
                  lower.compare(lower.size() - 5, 5, ".jpeg") == 0))
@@ -55,10 +58,11 @@ static std::vector<std::string> list_jpg_files(const std::string &dir)
 
 static void showUsage()
 {
-    DlLogI << "Usage: ./test_yolov5 [options]";
+    DlLogI << "Usage: ./test_yolov5_mt [options]";
     DlLogI << "  -n <name>   : 算法单元名称，默认 DlAlgorithmUnit_Yolov5";
     DlLogI << "  -d <dir>    : 图片目录，默认 ../../../resource/images";
     DlLogI << "  -l <level>  : 日志级别 0-4 (debug/info/warn/error/fatal)，默认 1";
+    DlLogI << "  -t <num>    : 线程数，默认 4";
     DlLogI << "  -h          : 显示帮助";
     exit(0);
 }
@@ -66,10 +70,11 @@ static void showUsage()
 static void getCustomOpt(int argc, char *argv[],
                          std::string &network_unit_name,
                          std::string &image_dir,
-                         DlLoggerSeverity &log_level)
+                         DlLoggerSeverity &log_level,
+                         int &num_threads)
 {
     int opt = 0;
-    const char *opt_string = "n:d:l:h";
+    const char *opt_string = "n:d:l:t:h";
     while (-1 != (opt = getopt(argc, argv, opt_string)))
     {
         switch (opt)
@@ -83,6 +88,9 @@ static void getCustomOpt(int argc, char *argv[],
         case 'l':
             log_level = static_cast<DlLoggerSeverity>(atoi(optarg));
             break;
+        case 't':
+            num_threads = std::max(1, atoi(optarg));
+            break;
         default:
             showUsage();
             break;
@@ -92,17 +100,18 @@ static void getCustomOpt(int argc, char *argv[],
 
 int main(int argc, char *argv[])
 {
-    DlLogI << "Test yolov5 start!";
+    DlLogI << "Test yolov5 multi-thread start!";
 
-    // 参数默认值
-    std::string network_unit_name = "DlAlgorithmUnit_Yolov5";   // DlAlgorithmUnitYolov5
+    // 默认参数
+    std::string network_unit_name = "DlAlgorithmUnit_Yolov5";
     std::string image_dir = "../../../resource/images";
     DlLoggerSeverity log_level = DlLoggerSeverity_INFO;
+    int num_threads = 16;
 
-    getCustomOpt(argc, argv, network_unit_name, image_dir, log_level);
+    getCustomOpt(argc, argv, network_unit_name, image_dir, log_level, num_threads);
     setDlLoggerSeverity(log_level);
 
-    // 枚举图片
+    // 枚举所有图片
     auto image_files = list_jpg_files(image_dir);
     if (image_files.empty())
     {
@@ -112,126 +121,158 @@ int main(int argc, char *argv[])
     std::cout << "[INFO] found " << image_files.size()
               << " images in " << image_dir << std::endl;
 
-    // 获取设备 & 算法单元
+    // 获取设备 & 算法单元（所有线程共享一个）
     int device_id = 0;
     auto dl_device    = DlcudaDeviceManager::getInstance().getDlcudaDevice(device_id);
     auto dlnne_device = DlnneDeviceManager::getInstance().getDlnneDevice(device_id);
-    auto dlnne_network_unit = dlnne_device->requireDlAlgorithmUnit(network_unit_name);
+    auto dlnne_network_unit =
+        dlnne_device->requireDlAlgorithmUnit(network_unit_name);
     dlnne_network_unit->waitEngineSetupDone();
 
-    auto h2d_copy_helper =
-        dl_device->getMemCopyHelper(cudaMemcpyHostToDevice);
+    auto start_all = std::chrono::steady_clock::now();
 
-    int frame_index = 0;
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
 
-    for (const auto &img_path : image_files)
+    for (int t = 0; t < num_threads; ++t)
     {
-        std::cout << "================================================\n";
-        std::cout << "[INFO] load image: " << img_path << std::endl;
-
-        // 1) 读 BGR 图
-        cv::Mat bgr = cv::imread(img_path, cv::IMREAD_COLOR);
-        if (bgr.empty())
+        workers.emplace_back([t,
+                              &image_files,
+                              dl_device,
+                              dlnne_network_unit]()
         {
-            std::cerr << "[WARN] imread failed: " << img_path << std::endl;
-            continue;
-        }
+            DlLogI << "[Thread " << t << "] start.";
 
-        int width  = bgr.cols;
-        int height = bgr.rows;
+            // 每个线程自己的 memcpy helper
+            auto h2d_copy_helper =
+                dl_device->getMemCopyHelper(cudaMemcpyHostToDevice);
 
-        // 2) 宽高若不是 2 的倍数，裁掉最后一行/列（YUV420 要求偶数）
-        if (width % 2 != 0 || height % 2 != 0)
-        {
-            int even_w = width  & ~1;
-            int even_h = height & ~1;
-            cv::Rect roi(0, 0, even_w, even_h);
-            bgr = bgr(roi).clone();
-            width  = even_w;
-            height = even_h;
-            std::cout << "[INFO] adjust to even size: "
-                      << width << "x" << height << std::endl;
-        }
+            std::vector<std::future<std::shared_ptr<DlnneUserOutputBase>>> futures;
+            futures.reserve(image_files.size());
 
-        // 3) BGR -> YUV420P (I420 / YU12)
-        cv::Mat yuv;
-        try
-        {
-            cv::cvtColor(bgr, yuv, cv::COLOR_BGR2YUV_I420);
-        }
-        catch (const cv::Exception &e)
-        {
-            std::cerr << "[WARN] cvtColor failed for "
-                      << img_path << ": " << e.what() << std::endl;
-            continue;
-        }
+            // ☆☆☆ 关键修改：每个线程完整遍历 image_files ☆☆☆
+            for (size_t idx = 0; idx < image_files.size(); ++idx)
+            {
+                const std::string &img_path = image_files[idx];
+                // std::cout << "[Thread " << t << "] load image: "                          << img_path << std::endl;
 
-        if (yuv.cols != width || yuv.rows != height * 3 / 2)
-        {
-            std::cerr << "[WARN] yuv shape mismatch for "
-                      << img_path << ", got "
-                      << yuv.cols << "x" << yuv.rows
-                      << ", expect " << width << "x" << height * 3 / 2
-                      << std::endl;
-            continue;
-        }
+                // 1) 读 BGR 图
+                cv::Mat bgr = cv::imread(img_path, cv::IMREAD_COLOR);
+                if (bgr.empty())
+                {
+                    std::cerr << "[Thread " << t
+                              << "] WARN imread failed: " << img_path << std::endl;
+                    continue;
+                }
 
-        // 4) 拷贝到 host DlFrame (YUV420P)
-        auto host_frame = std::make_shared<DlFrame>(DlMemoryType_Host);
-        host_frame->resize(width, height, DlPixelFormat_YUV420P);
-        host_frame->index = frame_index++;
-        if (host_frame->size != static_cast<uint64_t>(yuv.total()))
-        {
-            std::cerr << "[WARN] frame_size(" << host_frame->size
-                      << ") != yuv.total(" << yuv.total()
-                      << ") for " << img_path << std::endl;
-        }
-        std::memcpy(host_frame->data, yuv.data,
-                    std::min<uint64_t>(host_frame->size, yuv.total()));
+                int width  = bgr.cols;
+                int height = bgr.rows;
 
-        // 5) 拷贝到 device DlFrame
-        auto dev_frame = std::make_shared<DlFrame>(DlMemoryType_Device);
-        dev_frame->resize(width, height, DlPixelFormat_YUV420P);
-        dev_frame->index = host_frame->index;
+                // 2) 宽高若不是 2 的倍数，裁掉最后一行/列（YUV420 要求偶数）
+                if (width % 2 != 0 || height % 2 != 0)
+                {
+                    int even_w = width  & ~1;
+                    int even_h = height & ~1;
+                    cv::Rect roi(0, 0, even_w, even_h);
+                    bgr = bgr(roi).clone();
+                    width  = even_w;
+                    height = even_h;
+                    std::cout << "[Thread " << t << "] adjust to even size: "
+                              << width << "x" << height << std::endl;
+                }
 
-        h2d_copy_helper
-            ->addMemcpyTask(dev_frame->data,
-                            host_frame->data,
-                            host_frame->size)
-            .get();
+                // 3) BGR -> YUV420P (I420)
+                cv::Mat yuv;
+                try
+                {
+                    cv::cvtColor(bgr, yuv, cv::COLOR_BGR2YUV_I420);
+                }
+                catch (const cv::Exception &e)
+                {
+                    std::cerr << "[Thread " << t
+                              << "] cv::cvtColor failed for " << img_path
+                              << ", err = " << e.what() << std::endl;
+                    continue;   // 这一张跳过
+                }
 
-        // 6) 构造输入 & 推理
-        auto dlnne_input  = dlnne_network_unit->createTestInput(dev_frame);
-        auto base_output  = dlnne_network_unit
-                                ->addDlnneInferTask(dlnne_input)
-                                .get();
+                if (yuv.cols != width || yuv.rows != height * 3 / 2)
+                {
+                    std::cerr << "[Thread " << t
+                              << "] WARN yuv shape mismatch for " << img_path
+                              << ", got " << yuv.cols << "x" << yuv.rows
+                              << ", expect " << width << "x" << height * 3 / 2
+                              << std::endl;
+                    continue;
+                }
 
-        auto yolov5_output =
-            std::dynamic_pointer_cast<DlnneYolov5Output>(base_output);
+                // 4) 拷贝到 host DlFrame (YUV420P)
+                auto host_frame = std::make_shared<DlFrame>(DlMemoryType_Host);
+                host_frame->resize(width, height, DlPixelFormat_YUV420P);
+                // 帧 index 可以带线程信息，方便调试
+                host_frame->index = static_cast<int>(t * 1000000 + idx);
 
-        if (!yolov5_output)
-        {
-            std::cerr << "[ERROR] output cast to DlnneYolov5Output failed."
-                      << std::endl;
-            continue;
-        }
+                if (host_frame->size != static_cast<uint64_t>(yuv.total()))
+                {
+                    std::cerr << "[Thread " << t
+                              << "] WARN frame_size(" << host_frame->size
+                              << ") != yuv.total(" << yuv.total()
+                              << ") for " << img_path << std::endl;
+                }
 
-        // 7) 打印结果
-        std::cout << "[RESULT] detections for " << img_path << ":\n";
-        for (const auto &rect : yolov5_output->rect_vector)
-        {
-            std::cout << "  cls=" << rect.classification
-                      << " score=" << rect.precision
-                      << " box=(" << rect.left << "," << rect.top
-                      << "," << rect.right << "," << rect.bottom << ")"
-                      << std::endl;
-        }
+                std::memcpy(host_frame->data, yuv.data,
+                            std::min<uint64_t>(host_frame->size, yuv.total()));
 
-        // 可选：调用已有的 checkNetworkOutput，在图片上画框并输出 output.jpg
-        dlnne_network_unit->checkNetworkOutput(base_output);
+                // 5) 拷贝到 device DlFrame
+                auto dev_frame = std::make_shared<DlFrame>(DlMemoryType_Device);
+                dev_frame->resize(width, height, DlPixelFormat_YUV420P);
+                dev_frame->index = host_frame->index;
+
+                h2d_copy_helper
+                    ->addMemcpyTask(dev_frame->data,
+                                    host_frame->data,
+                                    host_frame->size)
+                    .get();
+
+                // 6) 构造输入 & 入队推理（不立即 get，让引擎自己组 batch）
+                auto dlnne_input = dlnne_network_unit->createTestInput(dev_frame);
+                futures.emplace_back(
+                    dlnne_network_unit->addDlnneInferTask(dlnne_input)
+                );
+            }
+
+            // 7) 线程收尾：等待所有 future 完成
+            for (auto &f : futures)
+            {
+                try
+                {
+                    auto base_output = f.get();
+                    (void)base_output;
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[Thread " << t
+                              << "] ERROR in future.get(): " << e.what()
+                              << std::endl;
+                }
+            }
+
+            DlLogI << "[Thread " << t << "] done.";
+        });
     }
 
+    for (auto &th : workers)
+    {
+        if (th.joinable()) th.join();
+    }
+
+    auto end_all = std::chrono::steady_clock::now();
+    double total_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            end_all - start_all).count() / 1000.0;
+
+    DlLogI << "All tasks done. total cost = " << total_ms << " ms";
+
     dlnne_device->releaseDlAlgorithmUnit(network_unit_name);
-    DlLogI << "Test yolov5 done!";
+    DlLogI << "Test yolov5 multi-thread done!";
     return 0;
 }

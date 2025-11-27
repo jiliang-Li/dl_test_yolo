@@ -9,6 +9,7 @@
 #include "dlcuda/dl_packet_frame.h"
 #include "dlvid/dl_vpu_device.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -136,7 +137,6 @@ namespace dl
         // 序列化模型默认以.slz文件后缀名
         m_is_serialized_engine = (m_model_path.find(".slz") != std::string::npos);
 
-
         m_input_width = 640;
         m_input_height = 640;
 
@@ -168,6 +168,19 @@ namespace dl
 
     std::shared_ptr<DlnneUserOutputBase> DlAlgorithmUnitYolov5::postProcess(std::shared_ptr<DlnneUserInputBase> input, int batch_index, DlnneNetworkInout* host_inout)
     {
+        // ---- 批次统计 & 计时（executor 内部是单线程调用 postProcess，用 static 就够了）----
+        int batch_size = host_inout->execute_batch;
+        static int s_batch_id = 0;
+        static std::chrono::steady_clock::time_point s_batch_start;
+
+        if (batch_index == 0)
+        {
+            // 新的一个 batch 开始
+            ++s_batch_id;
+            s_batch_start = std::chrono::steady_clock::now();
+            // DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " start, batch_size = " << batch_size;
+        }
+
         /* 分析当前batch的算法结果，保存到yolonano_output中 */
         auto yolov5_output = std::make_shared<DlnneYolov5Output>();
         auto yolov5_input = std::dynamic_pointer_cast<DlnneYolov5Input>(input);
@@ -286,6 +299,14 @@ namespace dl
         // 3. NMS
         dlNMSBoxes(yolov5_output->rect_vector, m_nmsThreshold);
 
+        // 记录 batch 结束耗时（默认 batch 中最后一张的 batch_index = s_batch_size-1）
+        if (batch_index == (batch_size - 1))
+        {
+            auto end = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - s_batch_start).count() / 1000.0;
+            DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " done, cost = " << ms << " ms, batch_size = " << batch_size;;
+        }
+
         yolov5_output->input = input;
         return yolov5_output;
     }
@@ -309,13 +330,13 @@ namespace dl
         DlLogI << "frame " << host_frame->index << "： ";
         for (auto rect : yolov5_output->rect_vector)
         {
-            DlLogI << "id=" << rect.classification << ", "
-                << (!classes.empty() ? classes[rect.classification] : " ") << ", "
-                << rect.precision << ", ("
-                << rect.left << ","
-                << rect.top << ","
-                << rect.right << ","
-                << rect.bottom << ")";
+            // DlLogI << "id=" << rect.classification << ", "
+            //     << (!classes.empty() ? classes[rect.classification] : " ") << ", "
+            //     << rect.precision << ", ("
+            //     << rect.left << ","
+            //     << rect.top << ","
+            //     << rect.right << ","
+            //     << rect.bottom << ")";
 
             rect.left = rect.left / 2 * 2;
             rect.right = rect.right / 2 * 2;
