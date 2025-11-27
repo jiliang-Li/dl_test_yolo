@@ -128,8 +128,6 @@ namespace dl
         m_max_batch = 28;
         m_model_path = "/dl/DlDeepToolkit-master/c++/resource/yolov5s.onnx";
         //m_model_path = "../../../resource/yolov5s.slz";
-        m_model_path = "/dl/DlDeepToolkit-master/c++/testyolo/onion_yolo-28x3x736x640.slz";
-        m_model_path = "../../resource/onion_yolo-736x640-modified.onnx";
         m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/coco.names";
 
         // 序列化模型默认以.slz文件后缀名
@@ -137,7 +135,7 @@ namespace dl
 
 
         m_input_width = 640;
-        m_input_height = 384;
+        m_input_height = 640;
 
         ifstream ifs(m_classesFile.c_str());
         string line;
