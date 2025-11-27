@@ -130,6 +130,9 @@ namespace dl
         //m_model_path = "../../../resource/yolov5s.slz";
         m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/coco.names";
 
+        m_model_path = "/dl/DlDeepToolkit-master/c++/resource/onion59_28x3x640x640.slz";
+        m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/onion_yolo.names";
+
         // 序列化模型默认以.slz文件后缀名
         m_is_serialized_engine = (m_model_path.find(".slz") != std::string::npos);
 
