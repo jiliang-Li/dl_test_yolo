@@ -82,23 +82,25 @@ def bytes2image(imgbytes, **kwargs):
 
 
 def client(name="", nums=1):
-    # frame = np.random.randint(0, 255, size=(640, 640, 3), dtype=np.uint8)
     frame = cv2.imread('imgs/000001.jpg')
     frame = cv2.resize(frame, (1280, 640))
     ip = "192.168.6.49"
     port = 6650
     model_name = "yolo5"
     url = f"http://{ip}:{port}/predictions/{model_name}"
-    # data = {'data': cv2bytes(frame, quality=99), "codec": "cv2bytes", "size": [640, 640]}
-    # data = {'body': [cv2pil2bytes2(frame, quality=99)], "codec": "cv2pil2bytes2", "size": [640, 640]}
-    data = {
-        "data": cv2bytes(frame, quality=99),  # 不要放在 list 里
+
+    jpg_data = cv2bytes(frame, quality=99)
+    params = {
         "codec": "cv2bytes",
-        "size": "[640,640]"  # 或 "640,640"
+        "size": "[640,640]",
     }
 
     for i in range(nums):
-        r = requests.post(url=url, data=data)
+        r = requests.post(
+            url,
+            params=params,
+            data=jpg_data
+        )
         print(r.status_code, r.text)
     return 1
 

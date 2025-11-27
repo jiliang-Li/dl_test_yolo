@@ -148,37 +148,32 @@ int main(int argc, char* argv[])
                 DlLogI << "收到Post请求";
                  try
                  {
-                     // 1) 拿参数：data(bytes)、size(string)、codec(string)
-                     if (!req.has_param("data"))
-                     {
-                         res.status = 400;
-                         res.set_content(R"({"code":1,"msg":"missing 'data' field"})", "application/json");
-                         return;
-                     }
+                    // 1) URL 上的参数：?size=[640,640]&codec=cv2bytes
+                    std::string size_param;
+                    if (req.has_param("size")) {
+                        size_param = req.get_param_value("size");
+                    }
+                    std::string codec = "cv2bytes";
+                    if (req.has_param("codec")) {
+                        codec = req.get_param_value("codec");
+                    }
 
-                     const std::string& data_param = req.get_param_value("data");
-                     std::string size_param;
-                     if (req.has_param("size"))
-                     {
-                         size_param = req.get_param_value("size");
-                     }
 
-                     std::string codec = "cv2bytes";
-                     if (req.has_param("codec"))
-                     {
-                         codec = req.get_param_value("codec");
-                     }
+                    // 2) body 就是 JPEG bytes
+                    const std::string &body = req.body;
+                    if (body.empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"code":1,"msg":"empty body"})", "application/json");
+                        return;
+                    }
 
-                     // 2) data_param 是经过 x-www-form-urlencoded 解码后的二进制 JPEG
-                     std::vector<unsigned char> jpeg_data(data_param.begin(), data_param.end());
-
-                     cv::Mat bgr = cv::imdecode(jpeg_data, cv::IMREAD_COLOR);
-                     if (bgr.empty())
-                     {
-                         res.status = 400;
-                         res.set_content(R"({"code":2,"msg":"imdecode failed"})", "application/json");
-                         return;
-                     }
+                    std::vector<unsigned char> jpeg_data(body.begin(), body.end());
+                    cv::Mat bgr = cv::imdecode(jpeg_data, cv::IMREAD_COLOR);
+                    if (bgr.empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"code":2,"msg":"imdecode failed"})", "application/json");
+                        return;
+                    }
 
                      int img_w = bgr.cols;
                      int img_h = bgr.rows;
@@ -305,6 +300,9 @@ int main(int argc, char* argv[])
                      res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
                  }
              });
+
+
+
 
     // 简单的健康检查
     svr.Get("/ping", [](const httplib::Request&, httplib::Response& res)
