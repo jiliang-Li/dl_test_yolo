@@ -171,8 +171,6 @@ namespace dl
         /* 分析当前batch的算法结果，保存到yolonano_output中 */
         auto yolov5_output = std::make_shared<DlnneYolov5Output>();
         auto yolov5_input = std::dynamic_pointer_cast<DlnneYolov5Input>(input);
-        //auto dl_timer = DlTimerFactory::getInstance().createDlTimer(DlTimerType_CPU);
-        //dl_timer->start();
 
         /* 获取所有输出bindings */
         std::vector<DlnneNetworkBinding*> outBindings;
@@ -184,20 +182,21 @@ namespace dl
             outBindings.push_back(binding);
         }
 
+        // 原图尺寸与网络输入的比例（用于把坐标缩回原图）
         float ratioh = (float)yolov5_input->frame->height / m_input_height;
         float ratiow = (float)yolov5_input->frame->width / m_input_width;
         int class_num = classes.size();
 
-        int q = 0, i = 0, j = 0, nout = class_num + 5, c = 0;
+        int q = 0, i = 0, j = 0, nout = class_num + 5, c = 0;    // 每个 anchor：cx,cy,w,h,obj + num_classes
 
         int max_bindings = std::min(outBindings.size(), (size_t)3);
 
         /* 多尺度检测结果输出 */
-        for (int n = 0; n < max_bindings; n++)
+        for (int n = 0; n < max_bindings; ++n)
         {
             DlnneNetworkBinding* binding = outBindings[n];
 
-            /* 获取推理输出数据首地址*/
+            // 当前 batch 的输出首地址
             auto data_c = (char*)(binding->data) + batch_index * binding->getBindingSize() / binding->batch_count;
             float* data_f = (float*)data_c;
 
@@ -205,86 +204,88 @@ namespace dl
             int num_grid_y = (int)(m_input_height / m_stride[n]);
             int area = num_grid_x * num_grid_y;
 
-            //直接执行这句比较耗费算力，下面根据阈值过滤后，再做计算
-            //sigmoid(data_f, 3 * nout * area);
-
-            for (q = 0; q < 3; q++) /// anchor数
+            // 3 个 anchor
+            for (q = 0; q < 3; ++q)
             {
                 const float& anchor_w = m_anchors[n][q * 2];
                 const float& anchor_h = m_anchors[n][q * 2 + 1];
+
+                // 这一组 anchor 的起始指针
+                // HWC 布局: [num_grid_y, num_grid_x, nout]
                 float* pdata = data_f + q * nout * area;
 
-                for (i = 0; i < num_grid_y; i++)
+                for (i = 0; i < num_grid_y; ++i)
                 {
-                    for (j = 0; j < num_grid_x; j++)
+                    for (j = 0; j < num_grid_x; ++j)
                     {
-                        float& box_score = pdata[4 * area + i * num_grid_x + j];
+                        // ---- 1) 取 obj score ----
+                        int base_idx = i * num_grid_x * nout + j * nout; // (i,j) 这一格的起点
+                        float& box_score = pdata[base_idx + 4];
                         sigmoid(&box_score, 1);
-                        if (box_score > m_objThreshold)
+
+                        if (box_score <= m_objThreshold)
+                            continue;
+
+                        // ---- 2) 取分类得分，找最大类 ----
+                        float max_class_score = 0.f;
+                        int max_class_id = 0;
+
+                        for (c = 0; c < class_num; ++c)
                         {
-                            float max_class_socre = 0, class_socre = 0;
-                            int max_class_id = 0;
-                            for (c = 0; c < class_num; c++) //// get max socre
+                            float& cls_score = pdata[base_idx + 5 + c];
+                            sigmoid(&cls_score, 1);
+                            if (cls_score > max_class_score)
                             {
-                                class_socre = pdata[(c + 5) * area + i * num_grid_x + j];
-                                sigmoid(&class_socre, 1);
-                                if (class_socre > max_class_socre)
-                                {
-                                    max_class_socre = class_socre;
-                                    max_class_id = c;
-                                }
-                            }
-
-                            if (max_class_socre > m_confThreshold)
-                            {
-                                float cx = pdata[i * num_grid_x + j]; /// cx
-                                float cy = pdata[area + i * num_grid_x + j]; /// cy
-                                float w = pdata[2 * area + i * num_grid_x + j]; /// w
-                                float h = pdata[3 * area + i * num_grid_x + j]; /// h
-
-                                sigmoid(&cx, 1);
-                                sigmoid(&cy, 1);
-                                sigmoid(&w, 1);
-                                sigmoid(&h, 1);
-
-                                cx = (cx * 2.f - 0.5f + j) * m_stride[n];
-                                cy = (cy * 2.f - 0.5f + i) * m_stride[n];
-                                w = powf(w * 2.f, 2.f) * anchor_w;
-                                h = powf(h * 2.f, 2.f) * anchor_h;
-
-                                DlnneRectI obj;
-                                obj.left = (cx - 0.5 * w) * ratiow;
-                                obj.top = (cy - 0.5 * h) * ratioh; ///坐标还原到原图上
-                                obj.right = obj.left + (int)(w * ratiow);
-                                obj.bottom = obj.top + (int)(h * ratioh);
-                                obj.classification = max_class_id;
-                                obj.precision = max_class_socre;
-
-                                yolov5_output->rect_vector.push_back(obj);
+                                max_class_score = cls_score;
+                                max_class_id = c;
                             }
                         }
+
+                        if (max_class_score <= m_confThreshold)
+                            continue;
+
+                        // ---- 3) 取回归框参数 cx,cy,w,h ----
+                        float cx = pdata[base_idx + 0];
+                        float cy = pdata[base_idx + 1];
+                        float w = pdata[base_idx + 2];
+                        float h = pdata[base_idx + 3];
+
+                        sigmoid(&cx, 1);
+                        sigmoid(&cy, 1);
+                        sigmoid(&w, 1);
+                        sigmoid(&h, 1);
+
+                        // 映射到网络输入尺度（YOLOv5 的 decode 公式）
+                        cx = (cx * 2.f - 0.5f + j) * m_stride[n];
+                        cy = (cy * 2.f - 0.5f + i) * m_stride[n];
+                        w = powf(w * 2.f, 2.f) * anchor_w;
+                        h = powf(h * 2.f, 2.f) * anchor_h;
+
+                        // ---- 4) 映射回原图，并裁剪到图像内部 ----
+                        DlnneRectI obj;
+                        obj.left = static_cast<int>((cx - 0.5f * w) * ratiow);
+                        obj.top = static_cast<int>((cy - 0.5f * h) * ratioh);
+                        obj.right = static_cast<int>(obj.left + w * ratiow);
+                        obj.bottom = static_cast<int>(obj.top + h * ratioh);
+                        obj.classification = max_class_id;
+                        obj.precision = max_class_score;
+
+                        // 裁剪到原图范围
+                        clip_box_to_image(obj, yolov5_input->frame->width, yolov5_input->frame->height);
+
+                        // 无效框丢弃
+                        if (obj.right <= obj.left || obj.bottom <= obj.top)
+                            continue;
+
+                        yolov5_output->rect_vector.push_back(obj);
                     }
                 }
             }
         }
 
-        // 1.5 统一把所有框 clamp 到图像内部，并过滤无效框
-        auto &boxes = yolov5_output->rect_vector;
-        for (auto it = boxes.begin(); it != boxes.end(); )
-        {
-            clip_box_to_image(*it, yolov5_input->frame->width, yolov5_input->frame->height);
-
-            // 裁剪后如果已经没有有效面积（完全在图外 / 退化成线），丢弃
-            if (it->right <= it->left || it->bottom <= it->top) {
-                it = boxes.erase(it);
-                continue;
-            }
-            ++it;
-        }
-
+        // 3. NMS
         dlNMSBoxes(yolov5_output->rect_vector, m_nmsThreshold);
-        //dl_timer->stop();
-        //DlLogI <<"postProcess " << dl_timer->last_elapsed() << " ms";
+
         yolov5_output->input = input;
         return yolov5_output;
     }
