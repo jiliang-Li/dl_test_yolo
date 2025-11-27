@@ -7,7 +7,6 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-#define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH (50 * 1024 * 1024)
 #include <httplib.h>
 #include <opencv2/opencv.hpp>
 
@@ -117,6 +116,37 @@ int main(int argc, char* argv[])
 {
     DlLogI << "HTTP Yolov5 server start!";
 
+    // 默认端口
+    int port = 6650;
+
+    // 解析命令行参数：-p <port>
+    int opt = 0;
+    const char *opt_string = "p:h";
+    while ((opt = getopt(argc, argv, opt_string)) != -1)
+    {
+        switch (opt)
+        {
+        case 'p':
+            {
+                int p = std::atoi(optarg);
+                if (p > 0 && p < 65536)
+                {
+                    port = p;
+                }
+                else
+                {
+                    std::cerr << "[ERROR] invalid port: " << optarg << std::endl;
+                    return -1;
+                }
+            }
+            break;
+        case 'h':
+        default:
+            std::cout << "Usage: " << argv[0] << " [-p port]" << std::endl;
+            return 0;
+        }
+    }
+
     int device_id = 0;
     DlPixelFormat pixel_format = DlPixelFormat_YUV420P;
     std::string network_unit_name = "DlAlgorithmUnit_Yolov5";
@@ -131,21 +161,20 @@ int main(int argc, char* argv[])
     svr.set_payload_max_length(10 * 1024 * 1024);   // 允许最多 <n>MB 的 body: n * 1024 * 1024
 
     // 简单 access log
-    svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
-        DlLogI << "[HTTP] " << req.method << " " << req.path << " status=" << res.status << " body_len=" << req.body.size();
-    });
+    // svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
+    //     DlLogI << "[HTTP] " << req.method << " " << req.path << " status=" << res.status << " body_len=" << req.body.size();
+    // });
 
     // 错误处理（4xx/5xx 时会走这里）
-    svr.set_error_handler([](const httplib::Request &req, httplib::Response &res) {
-        DlLogE << "[HTTP ERROR] " << res.status << " on " << req.method << " " << req.path << ", body_len=" << req.body.size();
-    });
+    // svr.set_error_handler([](const httplib::Request &req, httplib::Response &res) {
+    //     DlLogE << "[HTTP ERROR] " << res.status << " on " << req.method << " " << req.path << ", body_len=" << req.body.size();
+    // });
 
     // 路径兼容 TorchServe 风格: /predictions/<model_name>
     // svr.Post(R"(/predictions/(.+))",
     svr.Post("/predictions/yolo5", [dl_device, dlnne_network_unit, pixel_format]
         (const httplib::Request& req, httplib::Response& res)
              {
-                DlLogI << "收到Post请求";
                  try
                  {
                     // 1) URL 上的参数：?size=[640,640]&codec=cv2bytes
@@ -157,7 +186,6 @@ int main(int argc, char* argv[])
                     if (req.has_param("codec")) {
                         codec = req.get_param_value("codec");
                     }
-
 
                     // 2) body 就是 JPEG bytes
                     const std::string &body = req.body;
@@ -177,7 +205,7 @@ int main(int argc, char* argv[])
 
                      int img_w = bgr.cols;
                      int img_h = bgr.rows;
-                     DlLogI << "[HTTP] recv image, codec=" << codec << ", size=" << img_w << "x" << img_h;
+                     // DlLogI << "[HTTP] recv image, codec=" << codec << ", size=" << img_w << "x" << img_h;
 
                      // 3) 解析 size，决定裁剪 patch 大小
                      int patch_w = 0, patch_h = 0;
@@ -192,7 +220,7 @@ int main(int argc, char* argv[])
                      }
 
                      auto patches = split_image_to_patches(bgr, patch_w, patch_h);
-                     DlLogI << "[HTTP] split into " << patches.size() << " patches.";
+                     // DlLogI << "[HTTP] split into " << patches.size() << " patches.";
 
                      // 4) 为每个 patch 构造 DlFrame、异步提交推理任务
                      auto h2d_copy_helper = dl_device->getMemCopyHelper(cudaMemcpyHostToDevice);
@@ -244,48 +272,48 @@ int main(int argc, char* argv[])
                          tasks.push_back(TaskCtx{std::move(fut), p.offset_x, p.offset_y});
                      }
 
-                     // 5) 等待所有 patch 的结果，并汇总
-                     //    这里简单返回 JSON 数组，每个元素是一个检测框
-                     std::ostringstream oss;
-                     oss << R"({"code":0,"msg":"ok","detections":[)";
+                    // 5) 等待所有 patch 的结果，并汇总
+                    //    返回 list: [[x1,y1,x2,y2,score,cls], ...]
+                    std::ostringstream oss;
+                    oss << "[";
 
-                     bool first_det = true;
+                    bool first_det = true;
 
-                     for (auto& tk : tasks)
-                     {
-                         auto base_output = tk.fut.get();
-                         auto yolo_out = std::dynamic_pointer_cast<DlnneYolov5Output>(base_output);
-                         if (!yolo_out) continue;
+                    for (auto& tk : tasks)
+                    {
+                        auto base_output = tk.fut.get();
+                        auto yolo_out = std::dynamic_pointer_cast<DlnneYolov5Output>(base_output);
+                        if (!yolo_out) continue;
 
-                         for (auto& rect : yolo_out->rect_vector)
-                         {
-                             // 如果你想返回“原图全局坐标”，在这里加偏移即可：
-                             int gx1 = rect.left + tk.offset_x;
-                             int gy1 = rect.top + tk.offset_y;
-                             int gx2 = rect.right + tk.offset_x;
-                             int gy2 = rect.bottom + tk.offset_y;
+                        for (auto& rect : yolo_out->rect_vector)
+                        {
+                            // 原图全局坐标
+                            int gx1 = rect.left   + tk.offset_x;
+                            int gy1 = rect.top    + tk.offset_y;
+                            int gx2 = rect.right  + tk.offset_x;
+                            int gy2 = rect.bottom + tk.offset_y;
 
-                             if (!first_det)
-                             {
-                                 oss << ",";
-                             }
-                             first_det = false;
+                            if (!first_det)
+                            {
+                                oss << ",";
+                            }
+                            first_det = false;
 
-                             oss << "{"
-                                 << R"("cls":)" << rect.classification << ","
-                                 << R"("score":)" << rect.precision << ","
-                                 << R"("x1":)" << gx1 << ","
-                                 << R"("y1":)" << gy1 << ","
-                                 << R"("x2":)" << gx2 << ","
-                                 << R"("y2":)" << gy2
-                                 << "}";
-                         }
-                     }
+                            // [x1, y1, x2, y2, score, cls]
+                            oss << "["
+                                << gx1 << "," << gy1 << ","
+                                << gx2 << "," << gy2 << ","
+                                << rect.precision << ","
+                                << rect.classification
+                                << "]";
+                        }
+                    }
 
-                     oss << "]}";
+                    oss << "]";
 
-                     res.status = 200;
-                     res.set_content(oss.str(), "application/json");
+                    res.status = 200;
+                    res.set_content(oss.str(), "application/json");
+
                  }
                  catch (const std::exception& e)
                  {
@@ -301,9 +329,6 @@ int main(int argc, char* argv[])
                  }
              });
 
-
-
-
     // 简单的健康检查
     svr.Get("/ping", [](const httplib::Request&, httplib::Response& res)
     {
@@ -311,7 +336,7 @@ int main(int argc, char* argv[])
         res.set_content("pong\n", "text/plain");
     });
 
-    int port = 6650;
+    // int port = 6650;
     DlLogI << "Listening on 0.0.0.0:" << port;
     svr.listen("0.0.0.0", port);
 
