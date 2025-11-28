@@ -126,12 +126,12 @@ namespace dl
     DlAlgorithmUnitYolov5::DlAlgorithmUnitYolov5(DlcudaDevice* device, const std::string& name)
         : DlnneNetworkUnit(device, name)
     {
-        m_max_batch = 28;
+        m_max_batch = 4;
         m_model_path = "/dl/DlDeepToolkit-master/c++/resource/yolov5s.onnx";
         //m_model_path = "../../../resource/yolov5s.slz";
         m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/coco.names";
 
-        m_model_path = "/dl/DlDeepToolkit-master/c++/resource/onion59_28x3x640x640.slz";
+        m_model_path = "/dl/DlDeepToolkit-master/c++/resource/onion59_" + std::to_string(m_max_batch) + "x3x640x640.slz";
         m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/onion_yolo.names";
 
         // 序列化模型默认以.slz文件后缀名
@@ -304,7 +304,7 @@ namespace dl
         {
             auto end = std::chrono::steady_clock::now();
             double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - s_batch_start).count() / 1000.0;
-            DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " done, cost = " << ms << " ms, batch_size = " << batch_size;;
+            // DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " done, cost = " << ms << " ms, batch_size = " << batch_size;;
         }
 
         yolov5_output->input = input;
