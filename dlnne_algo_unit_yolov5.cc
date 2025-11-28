@@ -126,7 +126,7 @@ namespace dl
     DlAlgorithmUnitYolov5::DlAlgorithmUnitYolov5(DlcudaDevice* device, const std::string& name)
         : DlnneNetworkUnit(device, name)
     {
-        m_max_batch = 4;
+        m_max_batch = 2;
         m_model_path = "/dl/DlDeepToolkit-master/c++/resource/yolov5s.onnx";
         //m_model_path = "../../../resource/yolov5s.slz";
         m_classesFile = "/dl/DlDeepToolkit-master/c++/resource/coco.names";
@@ -304,7 +304,7 @@ namespace dl
         {
             auto end = std::chrono::steady_clock::now();
             double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - s_batch_start).count() / 1000.0;
-            // DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " done, cost = " << ms << " ms, batch_size = " << batch_size;;
+            DlLogI << "[Yolov5 postProcess] batch " << s_batch_id << " done, cost = " << ms << " ms, batch_size = " << batch_size;;
         }
 
         yolov5_output->input = input;

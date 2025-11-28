@@ -224,6 +224,287 @@ int main(int argc, char *argv[])
             res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
         }
     });
+    // ----------------- 解码测试接口：POST /predictions/decode -----------------
+    svr.Post(
+        "/predictions/decode",
+        [dlvid_device, &yolo_units, &rr_index, device_id](const httplib::Request &req,
+                                                          httplib::Response &res) {
+        // DlLogI << "收到 POST /predictions/yolo5";
+
+        try {
+            // 1) URL 参数（目前不做裁图，只是解析出来，保持原有逻辑）
+            std::string size_param;
+            if (req.has_param("size")) {
+                size_param = req.get_param_value("size");
+            }
+            std::string codec = "cv2bytes";
+            if (req.has_param("codec")) {
+                codec = req.get_param_value("codec");
+            }
+
+            // 2) 请求体即为 JPEG bytes
+            const std::string &body = req.body;
+            if (body.empty()) {
+                res.status = 400;
+                res.set_content(R"({"code":1,"msg":"empty body"})", "application/json");
+                return;
+            }
+
+            std::vector<unsigned char> jpeg_data(body.begin(), body.end());
+
+            // 每个线程只初始化一次 CUDA device
+            thread_local bool s_cuda_inited = false;
+            if (!s_cuda_inited) {
+                DlLogI << "cuda_init";
+                assert(cudaSetDevice(device_id) == 0);
+                s_cuda_inited = true;
+            }
+
+            // ---- 2.5) 轮询选择一个 Yolov5 算法单元 ----
+            int idx = rr_index.fetch_add(1, std::memory_order_relaxed);
+            idx = idx % static_cast<int>(yolo_units.size());
+            auto dlnne_network = yolo_units[idx];
+            // 如需调试可打开：
+            // DlLogI << "[HTTP] dispatch to Yolov5 unit #" << idx;
+
+            // 3) 构造 DlBuffer（Host），调用框架内 JPEG 硬解码
+            DlBuffer jpeg_buffer(DlMemoryType_Host);
+            jpeg_buffer.resize(jpeg_data.size());
+            std::memcpy(jpeg_buffer.data, jpeg_data.data(), jpeg_data.size());
+
+            // 每次请求各自申请 / 释放一个 jpeg_decoder，避免多线程抢占
+            auto jpeg_decoder = dlvid_device->requireDlJpegDecoder();
+            auto frame = jpeg_decoder->decodeJpeg(jpeg_buffer);
+            dlvid_device->releaseDlJpegDecoder(jpeg_decoder);
+
+            if (!frame || frame->width <= 0 || frame->height <= 0) {
+                res.status = 500;
+                res.set_content(R"({"code":3,"msg":"decodeJpeg failed"})", "application/json");
+                return;
+            }
+
+            // DlLogI << "[HTTP] decodeJpeg OK, frame size "
+            //        << frame->width << "x" << frame->height;
+
+
+            // 5) 汇总检测结果，返回 list: [[x1,y1,x2,y2,score,cls], ...]
+            std::ostringstream oss;
+            oss << "[";
+            oss << "[50, 50, 100, 100, 0.5, 0]";
+            oss << "]";
+            res.status = 200;
+            res.set_content(oss.str(), "application/json");
+        }
+        catch (const std::exception &e) {
+            DlLogE << "[HTTP] exception: " << e.what();
+            res.status = 500;
+            std::string msg = std::string(R"({"code":500,"msg":")") + e.what() + "\"}";
+            res.set_content(msg, "application/json");
+        }
+        catch (...) {
+            DlLogE << "[HTTP] unknown exception";
+            res.status = 500;
+            res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
+        }
+    });
+    // ----------------- 推理测试接口：POST /predictions/infer -----------------
+    // ----------------- 纯推理性能测试：POST /predictions/infer -----------------
+    svr.Post(
+        "/predictions/infer",
+        [dlvid_device, &yolo_units, &rr_index, device_id](const httplib::Request &req,
+                                                          httplib::Response &res) {
+        try {
+            // 1) URL 参数（保持和 /predictions/yolo5 一致，方便复用压测脚本）
+            std::string size_param;
+            if (req.has_param("size")) {
+                size_param = req.get_param_value("size");
+            }
+            std::string codec = "cv2bytes";
+            if (req.has_param("codec")) {
+                codec = req.get_param_value("codec");
+            }
+
+            // 2) 请求体为 JPEG bytes
+            //    这里为了简单，依然要求每次请求都带一张图，
+            //    但只会在第一次调用时真正解码，后续都会复用同一个 frame。
+            const std::string &body = req.body;
+            if (body.empty()) {
+                res.status = 400;
+                res.set_content(R"({"code":1,"msg":"empty body"})", "application/json");
+                return;
+            }
+
+            std::vector<unsigned char> jpeg_data(body.begin(), body.end());
+
+            // 每个线程只初始化一次 CUDA device
+            thread_local bool s_cuda_inited = false;
+            if (!s_cuda_inited) {
+                DlLogI << "cuda_init";
+                assert(cudaSetDevice(device_id) == 0);
+                s_cuda_inited = true;
+            }
+
+            // 3) 轮询选择一个 Yolov5 算法单元
+            int idx = rr_index.fetch_add(1, std::memory_order_relaxed);
+            idx = idx % static_cast<int>(yolo_units.size());
+            auto dlnne_network = yolo_units[idx];
+
+            // 4) 构造 DlBuffer（Host），仅在第一次调用 infer 时做 JPEG 硬解码并缓存 frame
+            DlBuffer jpeg_buffer(DlMemoryType_Host);
+            jpeg_buffer.resize(jpeg_data.size());
+            std::memcpy(jpeg_buffer.data, jpeg_data.data(), jpeg_data.size());
+
+            // static 缓存解码后的 frame：
+            //  - 第一次调用 /predictions/infer 时执行解码
+            //  - 之后所有请求都直接复用 cached_frame，不再解码
+            static auto cached_frame = [&]() {
+                auto jpeg_decoder = dlvid_device->requireDlJpegDecoder();
+                auto frame        = jpeg_decoder->decodeJpeg(jpeg_buffer);
+                dlvid_device->releaseDlJpegDecoder(jpeg_decoder);
+                DlLogI << "decode frame";
+
+                if (!frame || frame->width <= 0 || frame->height <= 0) {
+                    DlLogE << "decodeJpeg failed in /predictions/infer";
+                    throw "decodeJpeg failed in /predictions/infer";
+                }
+                // DlLogI << "[HTTP] infer: cached frame " << frame->width << "x" << frame->height;
+                return frame;
+            }();
+
+            auto frame = cached_frame;
+
+            // 5) 送入 Yolov5 算法单元做推理（只做推理，不再解码）
+            auto input      = dlnne_network->createTestInput(frame);
+            auto future     = dlnne_network->addDlnneInferTask(input);
+            auto base_output = future.get();
+
+            auto yolo_out = std::dynamic_pointer_cast<DlnneYolov5Output>(base_output);
+            if (!yolo_out) {
+                res.status = 500;
+                res.set_content(R"({"code":4,"msg":"bad output type"})", "application/json");
+                return;
+            }
+
+            // 6) 和 /predictions/yolo5 一样的输出格式
+            std::ostringstream oss;
+            oss << "[";
+
+            bool first = true;
+            for (const auto &rect : yolo_out->rect_vector) {
+                int   x1    = rect.left;
+                int   y1    = rect.top;
+                int   x2    = rect.right;
+                int   y2    = rect.bottom;
+                float score = rect.precision;
+                int   cls   = rect.classification;
+                if (!first) {
+                    oss << ",";
+                }
+                first = false;
+                oss << "[" << x1 << "," << y1 << "," << x2 << "," << y2
+                    << "," << score << "," << cls << "]";
+            }
+
+            oss << "]";
+            res.status = 200;
+            res.set_content(oss.str(), "application/json");
+        }
+        catch (const std::exception &e) {
+            DlLogE << "[HTTP] exception in /predictions/infer: " << e.what();
+            res.status = 500;
+            std::string msg = std::string(R"({"code":500,"msg":")") + e.what() + "\"}";
+            res.set_content(msg, "application/json");
+        }
+        catch (...) {
+            DlLogE << "[HTTP] unknown exception in /predictions/infer";
+            res.status = 500;
+            res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
+        }
+    });
+
+    svr.Post(
+        "/predictions/post",
+        [dlvid_device, &yolo_units, &rr_index, device_id](const httplib::Request &req,
+                                                          httplib::Response &res) {
+        try {
+            // 1) URL 参数（保持和 /predictions/yolo5 一致，方便复用压测脚本）
+            std::string size_param;
+            if (req.has_param("size")) {
+                size_param = req.get_param_value("size");
+            }
+            std::string codec = "cv2bytes";
+            if (req.has_param("codec")) {
+                codec = req.get_param_value("codec");
+            }
+
+            // 2) 请求体为 JPEG bytes
+            //    这里为了简单，依然要求每次请求都带一张图，
+            //    但只会在第一次调用时真正解码，后续都会复用同一个 frame。
+            const std::string &body = req.body;
+            if (body.empty()) {
+                res.status = 400;
+                res.set_content(R"({"code":1,"msg":"empty body"})", "application/json");
+                return;
+            }
+
+            std::vector<unsigned char> jpeg_data(body.begin(), body.end());
+
+            // 每个线程只初始化一次 CUDA device
+            thread_local bool s_cuda_inited = false;
+            if (!s_cuda_inited) {
+                DlLogI << "cuda_init";
+                assert(cudaSetDevice(device_id) == 0);
+                s_cuda_inited = true;
+            }
+
+            // 3) 轮询选择一个 Yolov5 算法单元
+            int idx = rr_index.fetch_add(1, std::memory_order_relaxed);
+            idx = idx % static_cast<int>(yolo_units.size());
+            auto dlnne_network = yolo_units[idx];
+
+            // 4) 构造 DlBuffer（Host），仅在第一次调用 infer 时做 JPEG 硬解码并缓存 frame
+            DlBuffer jpeg_buffer(DlMemoryType_Host);
+            jpeg_buffer.resize(jpeg_data.size());
+            std::memcpy(jpeg_buffer.data, jpeg_data.data(), jpeg_data.size());
+
+            // static 缓存解码后的 frame：
+            //  - 第一次调用 /predictions/infer 时执行解码
+            //  - 之后所有请求都直接复用 cached_frame，不再解码
+            static auto cached_frame = [&]() {
+                auto jpeg_decoder = dlvid_device->requireDlJpegDecoder();
+                auto frame        = jpeg_decoder->decodeJpeg(jpeg_buffer);
+                dlvid_device->releaseDlJpegDecoder(jpeg_decoder);
+                DlLogI << "decode frame";
+
+                if (!frame || frame->width <= 0 || frame->height <= 0) {
+                    DlLogE << "decodeJpeg failed in /predictions/infer";
+                    throw "decodeJpeg failed in /predictions/infer";
+                }
+                // DlLogI << "[HTTP] infer: cached frame " << frame->width << "x" << frame->height;
+                return frame;
+            }();
+
+            auto frame = cached_frame;
+
+            // 5) 送入 Yolov5 算法单元做推理（只做推理，不再解码）
+            std::ostringstream oss;
+            oss << "[[50, 50, 100, 100, 0.5, 0]]";
+            res.status = 200;
+            res.set_content(oss.str(), "application/json");
+        }
+        catch (const std::exception &e) {
+            DlLogE << "[HTTP] exception in /predictions/infer: " << e.what();
+            res.status = 500;
+            std::string msg = std::string(R"({"code":500,"msg":")") + e.what() + "\"}";
+            res.set_content(msg, "application/json");
+        }
+        catch (...) {
+            DlLogE << "[HTTP] unknown exception in /predictions/infer";
+            res.status = 500;
+            res.set_content(R"({"code":500,"msg":"unknown error"})", "application/json");
+        }
+    });
+
 
     // ----------------- 启动监听 -----------------
     DlLogI << "Listening on 0.0.0.0:" << port;
